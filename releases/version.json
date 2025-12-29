@@ -1,0 +1,6 @@
+{
+  "version": "1.0.0",
+  "zipUrl": "releases/version.json",
+  "sha256": "84741FB6B076C00AFF2ABCD1B206BE5051FE5154712E9918EB14C0832E5CBB2A",
+  "required": ["loader.html", "license.html", "index.html"]
+}
