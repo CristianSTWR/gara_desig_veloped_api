@@ -1,6 +1,6 @@
 {
-  "version": "1.0.1",
-  "zipUrl": "https://github.com/CristianSTWR/gara_desig_veloped_api/releases/download/renderer-v1.0.1/renderer-1.0.1.zip",
-  "sha256": "D6CF320AB0574D81E6FF4BC9927BEEE482EB7E04126A4208FFFFF70C89551885",
+  "version": "1.0.2",
+  "zipUrl": "https://github.com/CristianSTWR/gara_desig_veloped_api/releases/download/renderer-v1.0.2/renderer-1.0.2.zip",
+  "sha256": "4E96B7F2846DC46F4DFE9CCD4B667B11154782AF231A4454B7E0F4945FF00EB9",
   "required": ["loader.html", "license.html", "index.html"]
 }
