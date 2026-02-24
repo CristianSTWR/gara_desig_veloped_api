@@ -1,7 +1,6 @@
 # main.py (PostgreSQL + SQLAlchemy AsyncSession) — REPARADO
 
 from datetime import datetime, timedelta, timezone
-import logging
 import os
 import secrets
 import hashlib
@@ -11,6 +10,7 @@ import string
 import jwt
 import smtplib
 from email.message import EmailMessage
+import smtplib
 from dotenv import load_dotenv
 from dateutil.relativedelta import relativedelta
 from sqlalchemy.dialects.postgresql import insert
@@ -23,36 +23,6 @@ from sqlalchemy.exc import DBAPIError
 import base64
 from fastapi import APIRouter, Request
 from fastapi.responses import RedirectResponse
-from starlette.middleware.cors import CORSMiddleware
-from starlette.middleware.trustedhost import TrustedHostMiddleware
-
-from config import (
-    APP_ENV,
-    IS_PROD,
-    JWT_SECRET,
-    JWT_ALGORITHM,
-    ACCESS_MINUTES,
-    REFRESH_DAYS,
-    PAYPAL_BASE_URL,
-    PAYPAL_CLIENT_ID,
-    PAYPAL_CLIENT_SECRET,
-    PAYPAL_RETURN_URL,
-    PAYPAL_CANCEL_URL,
-    PAYPAL_WEBHOOK_ID,
-    VERIFY_PAYPAL_WEBHOOKS,
-    ALLOWED_ORIGINS,
-    ALLOWED_HOSTS,
-    MAX_BODY_BYTES,
-    SMTP_HOST,
-    SMTP_PORT,
-    SMTP_USER,
-    SMTP_APP_PASSWORD,
-    EMAIL_FROM,
-    validate_settings,
-)
-
-from security_middleware import SecurityHeadersMiddleware, RequestIdMiddleware, MaxBodySizeMiddleware
-from rate_limit import TokenBucketLimiter
 from pydantic import BaseModel
 from typing import Optional
 from urllib.parse import urlparse, parse_qs
@@ -63,56 +33,23 @@ from models import Planes, PaypalEnv, License, PaypalWebhookEvent
 from db import get_db
 
 load_dotenv()
-validate_settings()
 
-# logging
-logging.basicConfig(level=(logging.INFO if IS_PROD else logging.DEBUG))
-logger = logging.getLogger("luna")
+JWT_SECRET = os.getenv("JWT_SECRET")
+JWT_ALG = os.getenv("JWT_ALGORITHM", "HS256")
+ACCESS_MINUTES = int(os.getenv("ACCESS_MINUTES", "15"))
+REFRESH_DAYS = int(os.getenv("REFRESH_DAYS", "60"))
+VERIFY_PAYPAL_WEBHOOKS = os.getenv("VERIFY_PAYPAL_WEBHOOKS", "true").lower() == "true"
 
-# FastAPI (docs off in prod)
-_docs = None if IS_PROD else "/docs"
-_redoc = None if IS_PROD else "/redoc"
-app = FastAPI(title="LUNA Licensing API", docs_url=_docs, redoc_url=_redoc)
+if not JWT_SECRET:
+    raise RuntimeError("JWT_SECRET no está definido en el entorno")
 
-# Middlewares
-app.add_middleware(RequestIdMiddleware)
-app.add_middleware(MaxBodySizeMiddleware, max_bytes=MAX_BODY_BYTES)
-app.add_middleware(SecurityHeadersMiddleware, is_prod=IS_PROD)
+app = FastAPI(title="LUNA Licensing API")
 
-# CORS (set ALLOWED_ORIGINS in env). If empty, do not enable permissive CORS.
-if ALLOWED_ORIGINS:
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=ALLOWED_ORIGINS,
-        allow_credentials=False,
-        allow_methods=["GET", "POST", "OPTIONS"],
-        allow_headers=["Authorization", "Content-Type", "X-Internal-Key", "X-Request-Id"],
-    )
-
-# Allowed hosts (recommended in prod). If empty, allow all.
-if ALLOWED_HOSTS:
-    app.add_middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS)
-
-
-# Simple in-memory rate limiters (recommended to offload to WAF in production)
-#  - sensitive endpoints: 1 req/sec with burst 10 per IP
-limiter_sensitive = TokenBucketLimiter(rate_per_sec=1.0, burst=10)
-#  - webhook: allow higher, but still avoid abuse
-limiter_webhook = TokenBucketLimiter(rate_per_sec=5.0, burst=50)
-
-def _client_ip(request: Request) -> str:
-    # If behind proxy, ensure your proxy sets X-Forwarded-For correctly.
-    xff = request.headers.get("x-forwarded-for")
-    if xff:
-        return xff.split(",")[0].strip()
-    return request.client.host if request.client else "unknown"
-
-def _rate_limit(request: Request, limiter: TokenBucketLimiter):
-    ip = _client_ip(request)
-    ok, retry = limiter.allow(ip)
-    if not ok:
-        raise HTTPException(status_code=429, detail="Too Many Requests", headers={"Retry-After": str(int(retry) + 1)})
-
+PAYPAL_BASE_URL = os.getenv("PAYPAL_BASE_URL", "https://api-m.sandbox.paypal.com")
+PAYPAL_CLIENT_ID = os.getenv("PAYPAL_CLIENT_ID")
+PAYPAL_CLIENT_SECRET = os.getenv("PAYPAL_CLIENT_SECRET")
+PAYPAL_RETURN_URL = os.getenv("PAYPAL_RETURN_URL", "https://francisca-tineal-estela.ngrok-free.dev/paypal/return")
+PAYPAL_CANCEL_URL = os.getenv("PAYPAL_CANCEL_URL", "https://francisca-tineal-estela.ngrok-free.dev/paypal/cancel")
 APP_CANCEL = "luna://paypal/cancel"
 
 # =========================
@@ -141,18 +78,6 @@ class ValidateRequest(BaseModel):
 def health():
     return {"ok": True}
 
-
-# =========================
-# INTERNAL AUTH (optional)
-# =========================
-INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY", "").strip()
-
-def require_internal_key(x_internal_key: str = Header(default="")):
-    """If INTERNAL_API_KEY is set, require X-Internal-Key header."""
-    if INTERNAL_API_KEY:
-        if not x_internal_key or x_internal_key != INTERNAL_API_KEY:
-            raise HTTPException(status_code=403, detail="Forbidden")
-
 # =========================
 # HELPERS
 # =========================
@@ -168,7 +93,7 @@ def issue_access_token(licenseKey: str, deviceId: str) -> str:
         "exp": int((now + timedelta(minutes=ACCESS_MINUTES)).timestamp()),
         "typ": "access",
     }
-    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALG)
 
 def issue_refresh_token() -> str:
     return secrets.token_urlsafe(48)
@@ -192,18 +117,11 @@ async def ensure_license_ok(db: AsyncSession, licenseKey: str, deviceId: str) ->
 
     if not lic:
         raise HTTPException(status_code=401, detail="Licencia inválida")
+    if lic["status"] != "active": raise HTTPException(status_code=403, detail="Licencia desactivada")
 
-    if lic["status"] != "active":
-        raise HTTPException(status_code=403, detail="Licencia desactivada")
-
-    # 1.1) Verificar expiración (UTC)
-    exp_at = lic["expires_at"]
-    if exp_at is not None:
-        # Si viene naive, asumimos UTC (mejor que comparar naive con aware)
-        if getattr(exp_at, "tzinfo", None) is None:
-            exp_at = exp_at.replace(tzinfo=timezone.utc)
-
-        if datetime.now(timezone.utc) >= exp_at:
+    if lic["expires_at"] is not None:
+        # OJO: esto usa utcnow() naive. Si tu DB guarda timestamptz, lo ideal es comparar en UTC consistente.
+        if datetime.utcnow() >= lic["expires_at"]:
             raise HTTPException(status_code=403, detail="Licencia expirada")
 
     license_id = lic["id"]
@@ -222,7 +140,7 @@ async def ensure_license_ok(db: AsyncSession, licenseKey: str, deviceId: str) ->
     dev = res.mappings().first()
 
     if dev:
-        if bool(dev["revoked"]):
+        if bool(dev["revoked"]) is True:
             raise HTTPException(status_code=403, detail="Dispositivo revocado")
 
         await db.execute(
@@ -245,13 +163,12 @@ async def ensure_license_ok(db: AsyncSession, licenseKey: str, deviceId: str) ->
         """),
         {"lid": license_id},
     )
-    row = res.mappings().first()
-    count_active = int(row["c"] or 0)
+    count_active = int(res.mappings().first()["c"])
 
     if count_active >= max_devices:
         raise HTTPException(status_code=409, detail="Límite de dispositivos alcanzado")
 
-    # 4) Insertar device nuevo
+    # 4) Insertar device nuevo (UUID generado en Python)
     device_row_id = str(uuid.uuid4())
 
     await db.execute(
@@ -304,21 +221,10 @@ async def validate_refresh(db: AsyncSession, refreshToken: str, deviceId: str) -
 
     if not rec:
         raise HTTPException(status_code=401, detail="Refresh token inválido")
-
     if bool(rec["revoked"]) is True:
         raise HTTPException(status_code=401, detail="Refresh token revocado")
-
-    exp_at = rec["expires_at"]  # ✅ SIEMPRE asignado aquí
-
-    if exp_at is None:
+    if rec["expires_at"] is None or datetime.utcnow() >= rec["expires_at"]:
         raise HTTPException(status_code=401, detail="Refresh token expirado")
-
-    if exp_at.tzinfo is None:
-        exp_at = exp_at.replace(tzinfo=timezone.utc)
-
-    if datetime.now(timezone.utc) >= exp_at:
-        raise HTTPException(status_code=401, detail="Refresh token expirado")
-
     if rec["device_id"] != deviceId:
         raise HTTPException(status_code=401, detail="Refresh token no pertenece a este dispositivo")
 
@@ -328,18 +234,16 @@ async def validate_refresh(db: AsyncSession, refreshToken: str, deviceId: str) -
 # ENDPOINTS
 # =========================
 @app.post("/activate", response_model=ActivateResponse)
-async def activate(req: ActivateRequest, request: Request, db: AsyncSession = Depends(get_db)):
-    _rate_limit(request, limiter_sensitive)
-    logger.info("activate request")
+async def activate(req: ActivateRequest, db: AsyncSession = Depends(get_db)):
+    print('asjdasjd')
     license_id = await ensure_license_ok(db, req.licenseKey, req.deviceId)
     access = issue_access_token(req.licenseKey, req.deviceId)
     refresh = await create_refresh_session(db, license_id, req.deviceId)
-    logger.info("activate issued tokens")
+    print('jasdasjdj')
     return {"accessToken": access, "refreshToken": refresh}
 
 @app.post("/refresh", response_model=RefreshResponse)
-async def refresh(req: RefreshRequest, request: Request, db: AsyncSession = Depends(get_db)):
-    _rate_limit(request, limiter_sensitive)
+async def refresh(req: RefreshRequest, db: AsyncSession = Depends(get_db)):
     try:
         license_key = await validate_refresh(db, req.refreshToken, req.deviceId)
         await ensure_license_ok(db, license_key, req.deviceId)
@@ -361,7 +265,7 @@ async def validate(
     token = authorization.split(" ", 1)[1].strip()
 
     try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Access token expirado")
     except jwt.InvalidTokenError:
@@ -450,10 +354,8 @@ from models import PaypalSubscription
 @app.post("/paypal/create-subscription")
 async def create_subscription(
     body: CreateSubscriptionBody,
-    request: Request,
     db: AsyncSession = Depends(get_db),
 ):
-    _rate_limit(request, limiter_sensitive)
     token = await get_access_token()
 
     payload = {
@@ -467,7 +369,7 @@ async def create_subscription(
         },
     }
     
-    logger.info("create-subscription for user_id=%s", body.user_id)
+    print('CORREO DEL USUARIO', body.correo_user)
 
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.post(
@@ -702,6 +604,7 @@ def paypal_return(subscription_id: str | None = None):
 def paypal_cancel():
     return {"ok": True, "status": "CANCELLED"}
 
+PAYPAL_WEBHOOK_ID = "34U442868F077541L"
 async def verify_paypal_webhook(request: Request, body: dict, token: str):
     # ✅ DEV BYPASS: permite Invoke-RestMethod sin headers
     if not VERIFY_PAYPAL_WEBHOOKS:
@@ -820,7 +723,6 @@ async def _mark_paypal_event(db: AsyncSession, *, event_row_id: int, status: str
 
 @app.post("/paypal/webhook")
 async def paypal_webhook(request: Request, db: AsyncSession = Depends(get_db)):
-    _rate_limit(request, limiter_webhook)
     body = await request.json()
 
     # ✅ ENV (ajústalo a tu config real)
@@ -973,45 +875,18 @@ async def paypal_webhook(request: Request, db: AsyncSession = Depends(get_db)):
             else:
                 if lic.status != "active":
                     lic.status = "active"
-                    lic.paypal_status = "ACTIVE"
-                    lic.cancel_requested = False
 
         # ✅ REVOCAR
-        lic = None
-
         if event_type in (
             "BILLING.SUBSCRIPTION.CANCELLED",
             "BILLING.SUBSCRIPTION.SUSPENDED",
             "BILLING.SUBSCRIPTION.EXPIRED",
         ):
-            # buscar licencia (si existe)
-            qlic = await db.execute(
-                select(License)
-                .where(License.user_id == subscription_id)
-                .order_by(desc(License.created_at))
-                .limit(1)
-            )
-            lic = qlic.scalar_one_or_none()
-
-            # ✅ SIEMPRE marcar intención de cancelación
-            if lic:
-                lic.cancel_requested = True
-
-            # ✅ Si es CANCELLED: NO tocar status local ni revocar (PayPal puede seguir ACTIVE hasta fin de periodo)
-            if event_type == "BILLING.SUBSCRIPTION.CANCELLED":
-                pass
-
-            else:
-                # SUSPENDED / EXPIRED sí deben reflejarse localmente
-                map_status = {
-                    "BILLING.SUBSCRIPTION.SUSPENDED": "SUSPENDED",
-                    "BILLING.SUBSCRIPTION.EXPIRED": "EXPIRED",
-                }
-                row.status = map_status.get(event_type, row.status)
-
+            if getattr(row, "license_id", None):
+                lic = await db.get(License, row.license_id)
                 if lic:
                     lic.status = "revoked"
-                    lic.paypal_status = row.status
+
         # ✅ Marcar evento como processed + commit final
         await _mark_paypal_event(db, event_row_id=event_row_id, status="processed")
         await db.commit()
@@ -1031,18 +906,13 @@ async def paypal_webhook(request: Request, db: AsyncSession = Depends(get_db)):
         return {"ok": True, "msg": "Evento registrado pero falló el procesamiento", "error": str(e)}
 
 
-
 # 
 class CreateProductBody(BaseModel):
     name: str = "LUNA Premium"
     description: str = "Suscripción mensual a LUNA"
     
-
 @app.post("/paypal/create-product")
-async def create_product(
-    body: CreateProductBody,
-    _=Depends(require_internal_key),
-):
+async def create_product(body: CreateProductBody):
     token = await get_access_token()
 
     payload = {
@@ -1055,20 +925,12 @@ async def create_product(
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.post(
             f"{PAYPAL_BASE_URL}/v1/catalogs/products",
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-            },
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
             json=payload,
         )
 
     if r.status_code >= 400:
-        try:
-            detail = r.json()
-        except Exception:
-            detail = {"raw": r.text}
-        raise HTTPException(status_code=r.status_code, detail=detail)
+        raise HTTPException(status_code=400, detail=r.json())
 
     return r.json()
 
@@ -1078,23 +940,21 @@ class CreatePlanBody(BaseModel):
     currency: str = "USD"
 
 @app.post("/paypal/create-plan")
-async def create_plan(
-    body: CreatePlanBody,
-    _=Depends(require_internal_key),
-):
+async def create_plan(body: CreatePlanBody):
     token = await get_access_token()
 
     payload = {
         "product_id": body.product_id,
         "name": "LUNA Mensual",
+        "status": "ACTIVE",
         "billing_cycles": [
             {
                 "frequency": {"interval_unit": "MONTH", "interval_count": 1},
                 "tenure_type": "REGULAR",
                 "sequence": 1,
-                "total_cycles": 0,  # 0 = ilimitado
+                "total_cycles": 0,
                 "pricing_scheme": {
-                    "fixed_price": {"value": str(body.price), "currency_code": body.currency}
+                    "fixed_price": {"value": body.price, "currency_code": body.currency}
                 },
             }
         ],
@@ -1108,29 +968,19 @@ async def create_plan(
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.post(
             f"{PAYPAL_BASE_URL}/v1/billing/plans",
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-            },
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
             json=payload,
         )
 
     if r.status_code >= 400:
-        # Manejo robusto del error
-        try:
-            detail = r.json()
-        except Exception:
-            detail = {"raw": r.text}
-        raise HTTPException(status_code=r.status_code, detail=detail)
+        raise HTTPException(status_code=400, detail=r.json())
 
     return r.json()
+
 # Extraer datos licencias desde paypal
 
 @app.get("/license/extract")
 async def extract_license_info(
-    _=Depends(require_internal_key),
-
     license_key: str = Query(..., min_length=5),
     db: AsyncSession = Depends(get_db),
 ):
@@ -1194,553 +1044,49 @@ async def extract_license_info(
             "next_billing_time": next_billing_time,
         },
     }
- 
-VERIFY_TTL_HOURS = 6
-PAYPAL_FAIL_GRACE_HOURS = 24
-CANCEL_REFRESH_GRACE_MINUTES = 5
+    
+VERIFY_TTL_HOURS = 12          # cada cuánto refrescar contra PayPal
+PAYPAL_FAIL_GRACE_HOURS = 48   # si PayPal falla, cuánto tiempo confiar en cache local
 
+def parse_iso(dt: str | None):
+    if not dt:
+        return None
+    return datetime.fromisoformat(dt.replace("Z", "+00:00"))
 
-def utcnow() -> datetime:
+def utcnow():
     return datetime.now(timezone.utc)
 
-def safe_upper(v: str | None) -> str:
-    return (v or "").strip().upper()
-
-def parse_iso(s: str | None) -> datetime | None:
-    if not s:
-        return None
-    return datetime.fromisoformat(s.replace("Z", "+00:00"))
-
-def is_dt(v) -> bool:
-    return isinstance(v, datetime)
-
-def iso_or_none(v) -> str | None:
-    return v.isoformat() if is_dt(v) else None
-
-def get_attr(obj, name: str, default=None):
-    return getattr(obj, name, default)
-
-def set_attr_if_exists(obj, name: str, value):
-    if hasattr(obj, name):
-        setattr(obj, name, value)
-
-def is_stale(last_sync_at: datetime | None, ttl_hours: float) -> bool:
-    if not is_dt(last_sync_at):
+def is_stale(last_sync_at: datetime | None, ttl_hours: int) -> bool:
+    if not last_sync_at:
         return True
-    return (utcnow() - last_sync_at).total_seconds() > ttl_hours * 3600
+    return (utcnow() - last_sync_at) > timedelta(hours=ttl_hours)
 
-def can_trust_cache(last_sync_at: datetime | None, grace_hours: float) -> bool:
-    if not is_dt(last_sync_at):
+def can_trust_cache(last_sync_at: datetime | None, grace_hours: int) -> bool:
+    if not last_sync_at:
         return False
-    return (utcnow() - last_sync_at).total_seconds() <= grace_hours * 3600
-
-def compute_paid_through_monthly(last_payment_time: datetime | None) -> datetime | None:
-    if not is_dt(last_payment_time):
-        return None
-    return last_payment_time + relativedelta(months=1)
-
-def compute_premium_window(
-    paypal_status: str,
-    last_payment_time: datetime | None,
-    next_billing_time: datetime | None,
-) -> tuple[bool, datetime | None]:
-    """
-    premium = now < paid_through
-    paid_through = next_billing_time OR last_payment_time + 1 mes
-    """
-    now = utcnow()
-    status = safe_upper(paypal_status)
-
-    paid_through = next_billing_time if is_dt(next_billing_time) else None
-    if not paid_through:
-        paid_through = compute_paid_through_monthly(last_payment_time)
-
-    if not paid_through:
-        return False, None
-
-    if status == "EXPIRED":
-        return False, paid_through
-
-    return now < paid_through, paid_through
-
-CANCEL_REFRESH_WINDOW_HOURS = 24
-CANCEL_TTL_MINUTES = 15
-
-def refresh_due_to_cancel_requested(lic) -> bool:
-    if not bool(get_attr(lic, "cancel_requested", False)):
-        return False
-    at = get_attr(lic, "cancel_requested_at", None)
-    if not at:
-        return True  # no sabemos cuándo, refresca siempre
-    return utcnow() - at < timedelta(hours=CANCEL_REFRESH_WINDOW_HOURS)
-
-def compute_paid_through_local(lic) -> datetime | None:
-    """
-    Calcula paid_through aunque no tengas columna:
-    - si existe lic.paid_through úsalo
-    - si no, usa last_payment_time + 1 mes
-    """
-    pt = get_attr(lic, "paid_through", None)
-    if is_dt(pt):
-        return pt
-
-    lpt = get_attr(lic, "last_payment_time", None)
-    if is_dt(lpt):
-        return compute_paid_through_monthly(lpt)
-
-    return None
-
-def build_response(
-    lic,
-    subscription_id: str,
-    premium: bool,
-    source: str,
-    paypal_status_real: str | None = None,   # lo que PayPal dijo ahora/último refresh
-    paid_through: datetime | None = None,
-    warning: str | None = None,
-):
-    # cached status (lo que tengas guardado)
-    paypal_status_cached = get_attr(lic, "paypal_status", None)
-
-    # asegura paid_through aunque sea cache
-    paid_through_final = paid_through if is_dt(paid_through) else compute_paid_through_local(lic)
-
-    return {
-        "ok": True,
-        "premium": premium,
-        "source": source,
-        **({"warning": warning} if warning else {}),
-        "license": {
-            "license_key": lic.license_key,
-            "status_local": get_attr(lic, "status", None),
-            "subscription_id": subscription_id,
-            "last_sync_at": iso_or_none(get_attr(lic, "last_sync_at", None)),
-            "cancel_requested": bool(get_attr(lic, "cancel_requested", False)),
-            "paid_through": iso_or_none(paid_through_final),
-        },
-        "paypal": {
-            # ✅ NO confundir más:
-            "status_real": paypal_status_real,     # puede ser None en CACHE
-            "status_cached": paypal_status_cached, # lo que está en DB
-            # si quieres un solo "status" para el frontend:
-            # - en refresh: usa real
-            # - en cache: usa cached
-            "status": paypal_status_real if paypal_status_real is not None else paypal_status_cached,
-
-            "last_payment_time": iso_or_none(get_attr(lic, "last_payment_time", None)),
-            "last_payment_amount": str(get_attr(lic, "last_payment_amount", None))
-                if get_attr(lic, "last_payment_amount", None) is not None else None,
-            "last_payment_currency": get_attr(lic, "last_payment_currency", None),
-            "next_billing_time": iso_or_none(get_attr(lic, "next_billing_time", None)),
-        },
-    }
-
+    return (utcnow() - last_sync_at) <= timedelta(hours=grace_hours)
 
 def compute_premium_from_local(lic) -> bool:
-    """
-    Decide si la licencia es premium SOLO con datos locales.
-    No llama a PayPal.
-    """
-    # Si tienes status local
-    status = getattr(lic, "status", None)
-    if status == "active":
-        return True
-
-    # Fallback por fecha (si existe paid_through)
-    paid_through = getattr(lic, "paid_through", None)
-    if isinstance(paid_through, datetime):
-        return utcnow() < paid_through
-
-    # Último fallback: no premium
-    return False
-
-
-async def refresh_from_paypal(subscription_id: str) -> dict:
-    """
-    Devuelve el JSON de PayPal para una suscripción.
-    """
-    token = await get_access_token()
-
-    async with httpx.AsyncClient() as client:
-        r = await client.get(
-            f"{PAYPAL_BASE_URL}/v1/billing/subscriptions/{subscription_id}",
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-            },
-        )
-        r.raise_for_status()
-        return r.json()
-    
-def mark_suspicious(lic, reason: str):
-    """
-    Marca la licencia como sospechosa y corta el premium.
-    """
-    if hasattr(lic, "suspicious"):
-        lic.suspicious = True
-
-    if hasattr(lic, "suspicious_reason"):
-        lic.suspicious_reason = reason[:255]
-
-    if hasattr(lic, "suspicious_at"):
-        lic.suspicious_at = utcnow()
-
-    # 🔒 Corte inmediato local
-    if hasattr(lic, "status"):
-        lic.status = "revoked"
-    
-@app.get("/license/verify")
-async def verify_license(
-    _=Depends(require_internal_key),
-    license_key: str = Query(..., min_length=5),
-    force_refresh: bool = Query(False),
-    db: AsyncSession = Depends(get_db),
-):
-    # 1) Buscar licencia
-    q = await db.execute(select(License).where(License.license_key == license_key))
-    lic = q.scalar_one_or_none()
-    if not lic:
-        raise HTTPException(status_code=404, detail="Licencia no encontrada")
-    
-    if bool(get_attr(lic, "suspicious", False)):
-        return build_response(
-            lic=lic,
-            subscription_id=get_attr(lic, "user_id", None),
-            premium=False,
-            source="SECURITY_BLOCK",
-            paypal_status_real=None,
-            paid_through=get_attr(lic, "paid_through", None),
-            warning="LICENSE_MARKED_SUSPICIOUS",
-        )
-
-    # 2) subscription_id (nuevo campo primero, fallback al user_id antiguo)
-    subscription_id = (
-        (get_attr(lic, "paypal_subscription_id", None) or get_attr(lic, "user_id", None) or "")
-        .strip()
-    )
-
-    if not subscription_id:
-        return {
-            "ok": True,
-            "premium": False,
-            "reason": "NO_SUBSCRIPTION_ID",
-            "source": "NO_SUBSCRIPTION_ID",
-            "license": {
-                "license_key": get_attr(lic, "license_key", None),
-                "status_local": get_attr(lic, "status", None),
-                "subscription_id": None,
-                "last_sync_at": iso_or_none(get_attr(lic, "last_sync_at", None)),
-                "cancel_requested": bool(get_attr(lic, "cancel_requested", False)),
-                "paid_through": iso_or_none(get_attr(lic, "paid_through", None)),
-            },
-            "paypal": None,
-        }
-
-    # 3) Decide si refrescar:
-    #    - force_refresh=True => siempre PayPal
-    #    - cancel_requested=True => PayPal cada 15 min
-    #    - normal => PayPal por TTL VERIFY_TTL_HOURS
-    last_sync_at = get_attr(lic, "last_sync_at", None)
-    cancel_requested = bool(get_attr(lic, "cancel_requested", False))
-
-    cancel_stale = is_stale(last_sync_at, CANCEL_TTL_MINUTES / 60)  # minutos -> horas
-    normal_stale = is_stale(last_sync_at, VERIFY_TTL_HOURS)
-
-    must_refresh = bool(force_refresh) or (cancel_requested and cancel_stale) or normal_stale
-
-    # 4) CACHE si está fresco y no hay que refrescar
-    if not must_refresh:
-        premium_local = compute_premium_from_local(lic)
-        return build_response(
-            lic=lic,
-            subscription_id=subscription_id,
-            premium=premium_local,
-            source="CACHE",
-            paypal_status_real=None,  # cache: no consultamos PayPal
-            paid_through=get_attr(lic, "paid_through", None),
-        )
-
-    # 5) PAYPAL REFRESH
-    try:
-        data = await refresh_from_paypal(subscription_id)
-        paypal_status_real = safe_upper(data.get("status"))
-
-        billing_info = data.get("billing_info") or {}
-        last_payment = billing_info.get("last_payment") or {}
-
-        last_payment_time = parse_iso(last_payment.get("time"))
-        next_billing_time = parse_iso(billing_info.get("next_billing_time"))
-
-        premium_final, paid_through = compute_premium_window(
-            paypal_status=paypal_status_real,
-            last_payment_time=last_payment_time,
-            next_billing_time=next_billing_time,
-        )
-        
-        if paid_through and paid_through > utcnow() + timedelta(days=45):
-            mark_suspicious(
-                lic,
-                f"PAID_THROUGH_TOO_FAR paid_through={paid_through.isoformat()}"
-            )
-            premium_final = False
-
-        # Guardar mínimos
-        set_attr_if_exists(lic, "user_id", subscription_id)
-        set_attr_if_exists(lic, "last_sync_at", utcnow())
-
-        # Guardar billing SOLO si existen columnas
-        set_attr_if_exists(lic, "last_payment_time", last_payment_time)
-        set_attr_if_exists(lic, "last_payment_amount", (last_payment.get("amount") or {}).get("value"))
-        set_attr_if_exists(lic, "last_payment_currency", (last_payment.get("amount") or {}).get("currency_code"))
-        set_attr_if_exists(lic, "next_billing_time", next_billing_time)
-        set_attr_if_exists(lic, "paid_through", paid_through)
-
-        # ✅ CANCELLED pero aún pagado -> mantener premium, marcar cancel_requested, NO tocar paypal_status
-        if paypal_status_real == "CANCELLED" and premium_final:
-            set_attr_if_exists(lic, "cancel_requested", True)
-            if hasattr(lic, "cancel_requested_at") and get_attr(lic, "cancel_requested_at", None) is None:
-                set_attr_if_exists(lic, "cancel_requested_at", utcnow())
-            # NO tocar paypal_status
-        else:
-            set_attr_if_exists(lic, "paypal_status", paypal_status_real)
-            set_attr_if_exists(lic, "cancel_requested", paypal_status_real == "CANCELLED")
-            if hasattr(lic, "cancel_requested_at"):
-                set_attr_if_exists(
-                    lic,
-                    "cancel_requested_at",
-                    utcnow() if paypal_status_real == "CANCELLED" else None
-                )
-
-        # estado local
-        set_attr_if_exists(lic, "status", "active" if premium_final else "revoked")
-        await db.execute(text("SET LOCAL app.verified_write = '1'"))
-        await db.commit()
-        await db.refresh(lic)
-
-        return build_response(
-            lic=lic,
-            subscription_id=subscription_id,
-            premium=premium_final,
-            source="PAYPAL_REFRESH",
-            paypal_status_real=paypal_status_real,
-            paid_through=paid_through,
-        )
-
-    except Exception as e:
-        if can_trust_cache(get_attr(lic, "last_sync_at", None), PAYPAL_FAIL_GRACE_HOURS):
-            premium_local = compute_premium_from_local(lic)
-            return build_response(
-                lic=lic,
-                subscription_id=subscription_id,
-                premium=premium_local,
-                source="CACHE_FALLBACK",
-                paypal_status_real=None,
-                paid_through=get_attr(lic, "paid_through", None),
-                warning="PAYPAL_UNAVAILABLE_USING_CACHE",
-            )
-
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "msg": "PayPal no disponible y no hay cache confiable. Intenta de nuevo.",
-                "error": str(e),
-            },
-        )
-
-def enviar_correo(destinatario: str, key: str, max_devices: str, plan: str, renovacion: str, subscription_id: str):
-    # Si quieres usar un link real, define esto arriba o pásalo como parámetro
-    APP_OPEN_URL = "https://tu-dominio.com/abrir-luna"  # o luna://open si usas deep link
-
-    HTML_CONTENT = f"""\
-<!DOCTYPE html>
-<html lang="es">
-<head>
-  <meta charset="UTF-8">
-  <title>Licencia LUNA</title>
-</head>
-<body style="margin:0;padding:0;background:#c7cfe9;font-family:Arial,Helvetica,sans-serif;">
-  <table width="100%" cellpadding="0" cellspacing="0" style="background:#c7cfe9;padding:20px 0;">
-    <tr>
-      <td align="center">
-        <table width="600" cellpadding="0" cellspacing="0" style="background:#111a2e;border-radius:14px;border:1px solid #223053;">
-
-          <tr>
-            <td style="padding:24px;color:#ffffff;">
-              <h1 style="margin:0;font-size:22px;letter-spacing:2px;">L U N A</h1>
-              <p style="margin:4px 0 0;color:#a9b0c3;font-size:12px;">Licencia &amp; Suscripción</p>
-            </td>
-          </tr>
-
-          <tr>
-            <td style="padding:0 24px 24px;color:#ffffff;">
-              <h2 style="font-size:20px;margin:0 0 8px;">¡Gracias por tu compra! 🎉</h2>
-              <p style="color:#c7cce0;font-size:14px;line-height:1.6;">
-                Tu licencia de <strong>LUNA</strong> ya está activa. Guarda este correo, contiene la información
-                necesaria para usar tu app.
-              </p>
-
-              <div style="margin:20px 0;">
-                <p style="margin:0 0 6px;color:#a9b0c3;font-size:12px;">Tu clave de licencia:</p>
-                <div style="background:#0b1224;border:1px dashed #2a3a66;border-radius:10px;
-                  padding:12px;font-family:Consolas,monospace;font-size:16px;">
-                  {key}
-                </div>
-                <p style="margin:6px 0 0;color:#a9b0c3;font-size:12px;">
-                  Máximo de dispositivos: <strong style="color:#fff;">{max_devices}</strong>
-                </p>
-              </div>
-
-              <table width="100%" cellpadding="0" cellspacing="0" style="background:#0b1224;
-                border:1px solid #223053;border-radius:10px;padding:12px;margin-top:10px;">
-                <tr>
-                  <td style="color:#a9b0c3;font-size:12px;">Plan</td>
-                  <td align="right" style="color:#ffffff;font-size:12px;"><strong>{plan}</strong></td>
-                </tr>
-                <tr>
-                  <td style="color:#a9b0c3;font-size:12px;">Estado</td>
-                  <td align="right" style="color:#ffffff;font-size:12px;"><strong>ACTIVA</strong></td>
-                </tr>
-                <tr>
-                  <td style="color:#a9b0c3;font-size:12px;">Próxima renovación</td>
-                  <td align="right" style="color:#ffffff;font-size:12px;"><strong>{renovacion}</strong></td>
-                </tr>
-                <tr>
-                  <td style="color:#a9b0c3;font-size:12px;">ID Suscripción</td>
-                  <td align="right" style="color:#ffffff;font-size:12px;font-family:Consolas,monospace;">
-                    {subscription_id}
-                  </td>
-                </tr>
-              </table>
-
-              <div style="margin-top:18px;color:#c7cce0;font-size:14px;line-height:1.6;">
-                <strong style="color:#fff;">Cómo activar tu licencia:</strong>
-                <ol style="margin:8px 0 0 18px;padding:0;">
-                  <li>Abre la aplicación LUNA.</li>
-                  <li>Pega tu clave.</li>
-                  <li>Dale al botón de activar ahora.</li>
-                </ol>
-              </div>
-
-              <div style="margin-top:18px;">
-                <a href="{APP_OPEN_URL}" style="background:#6d5efc;color:#fff;
-                  padding:12px 18px;border-radius:10px;font-size:14px;font-weight:bold;
-                  text-decoration:none;display:inline-block;">
-                  Abrir LUNA
-                </a>
-              </div>
-
-              <p style="margin-top:16px;color:#a9b0c3;font-size:12px;line-height:1.6;">
-                Si tienes algún problema, responde a este correo indicando tu <strong>License Key</strong>
-                y tu <strong>ID de suscripción</strong>.
-                No compartas tu clave públicamente.
-              </p>
-
-              <hr style="border:none;border-top:1px solid #223053;margin:18px 0;">
-
-              <p style="color:#8f96ad;font-size:11px;">
-                © 2026 LUNA. Todos los derechos reservados.
-              </p>
-            </td>
-          </tr>
-
-        </table>
-      </td>
-    </tr>
-  </table>
-</body>
-</html>
-"""
-
-    # Validación antes de abrir SMTP (mejor)
-    if not SMTP_USER or not SMTP_APP_PASSWORD:
-        raise RuntimeError("SMTP_USER/SMTP_APP_PASSWORD no configurados")
-
-    msg = EmailMessage()
-    msg["Subject"] = "Licencia LUNA | Activación"
-    msg["From"] = EMAIL_FROM or SMTP_USER
-    msg["To"] = destinatario
-
-    # Texto plano útil (no lo dejes vacío)
-    msg.set_content(
-        f"Tu licencia LUNA está activa.\n\n"
-        f"Clave: {key}\n"
-        f"Plan: {plan}\n"
-        f"Máx. dispositivos: {max_devices}\n"
-        f"Próxima renovación: {renovacion}\n"
-        f"Suscripción: {subscription_id}\n"
-    )
-    msg.add_alternative(HTML_CONTENT, subtype="html")
-
-    try:
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
-            smtp.login(SMTP_USER, SMTP_APP_PASSWORD)
-            smtp.send_message(msg)
-        print("Correo enviado con éxito a", destinatario)
-        return True
-    except Exception as e:
-        print("Error al enviar correo:", e)
+    # Regla simple: paypal_status ACTIVE y licencia active
+    if (lic.paypal_status or "").upper() != "ACTIVE":
         return False
-    
-@app.get("/paypal/verify-subscription")
-async def verify_subscription(
-    user_id: str,
-    db: AsyncSession = Depends(get_db)
-):
-    # 1) Buscar última suscripción del usuario
-    q = await db.execute(
-        select(PaypalSubscription)
-        .where(PaypalSubscription.user_id == user_id)
-        .order_by(PaypalSubscription.created_at.desc())
-        .limit(1)
-    )
-    sub = q.scalar_one_or_none()
+    if (lic.status or "").lower() != "active":
+        return False
+    return True
 
-    if not sub:
-        return { "ok": False, "status": "NO_SUBSCRIPTION" }
-
-    # 2) Consultar PayPal
+async def refresh_from_paypal(subscription_id: str):
     token = await get_access_token()
-
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.get(
-            f"{PAYPAL_BASE_URL}/v1/billing/subscriptions/{sub.paypal_subscription_id}",
+            f"{PAYPAL_BASE_URL}/v1/billing/subscriptions/{subscription_id}",
             headers={"Authorization": f"Bearer {token}"},
         )
+    if r.status_code >= 400:
+        raise HTTPException(status_code=502, detail={"paypal_error": r.json()})
+    return r.json()
 
-    if r.status_code != 200:
-        return { "ok": False, "status": "PAYPAL_ERROR" }
-
-    data = r.json()
-    paypal_status = data["status"]  # ACTIVE, CANCELLED, SUSPENDED...
-
-    # 3) Buscar licencia usando subscription_id
-    q = await db.execute(
-        select(License)
-        .where(License.user_id == sub.paypal_subscription_id)
-        .limit(1)
-    )
-    license = q.scalar_one_or_none()
-
-    if not license:
-        return {
-            "ok": False,
-            "status": paypal_status,
-            "msg": "LICENSE_NOT_FOUND"
-        }
-
-    return {
-        "ok": paypal_status == "ACTIVE",
-        "subscription_id": sub.paypal_subscription_id,
-        "status": paypal_status,
-        "license_key": license.license_key,
-    }
-    
-# Verificar status del usuario
-
-@app.get("/verify/user")
-async def verify_user(
-    _=Depends(require_internal_key),
-
+@app.get("/license/verify")
+async def verify_license(
     license_key: str = Query(..., min_length=5),
     force_refresh: bool = Query(False),
     db: AsyncSession = Depends(get_db),
@@ -1862,6 +1208,187 @@ async def verify_user(
                 "error": str(e),
             },
         )
-  
+        
+
+def enviar_correo(destinatario: str, key, max_devices: str, plan: str, renovacion: str, subscription_id: str):
+    HTML_CONTENT = f"""
+    <!DOCTYPE html>
+        <html lang="es">
+        <head>
+        <meta charset="UTF-8">
+        <title>Licencia LUNA</title>
+        </head>
+        <body style="margin:0;padding:0;background:#c7cfe9;font-family:Arial,Helvetica,sans-serif;">
+        <table width="100%" cellpadding="0" cellspacing="0" style="background:#c7cfe9;padding:20px 0;">
+        <tr>
+        <td align="center">
+        <table width="600" cellpadding="0" cellspacing="0" style="background:#111a2e;border-radius:14px;border:1px solid #223053;">
+
+        <!-- Header -->
+        <tr>
+        <td style="padding:24px;color:#ffffff;">
+        <h1 style="margin:0;font-size:22px;letter-spacing:2px;">L U N A</h1>
+        <p style="margin:4px 0 0;color:#a9b0c3;font-size:12px;">Licencia & Suscripción</p>
+        </td>
+        </tr>
+
+        <!-- Contenido principal -->
+        <tr>
+        <td style="padding:0 24px 24px;color:#ffffff;">
+        <h2 style="font-size:20px;margin:0 0 8px;">¡Gracias por tu compra! 🎉</h2>
+        <p style="color:#c7cce0;font-size:14px;line-height:1.6;">
+        Tu licencia de <strong>LUNA</strong> ya está activa. Guarda este correo, contiene la información
+        necesaria para usar tu app.
+        </p>
+
+        <!-- Licencia -->
+        <div style="margin:20px 0;">
+        <p style="margin:0 0 6px;color:#a9b0c3;font-size:12px;">Tu clave de licencia:</p>
+        <div style="background:#0b1224;border:1px dashed #2a3a66;border-radius:10px;
+        padding:12px;font-family:Consolas,monospace;font-size:16px;">
+        {key}
+        </div>
+        <p style="margin:6px 0 0;color:#a9b0c3;font-size:12px;">
+        Máximo de dispositivos: <strong style="color:#fff;">{max_devices}</strong>
+        </p>
+        </div>
+
+        <!-- Detalles -->
+        <table width="100%" cellpadding="0" cellspacing="0" style="background:#0b1224;
+        border:1px solid #223053;border-radius:10px;padding:12px;margin-top:10px;">
+        <tr>
+        <td style="color:#a9b0c3;font-size:12px;">Plan</td>
+        <td align="right" style="color:#ffffff;font-size:12px;"><strong>{plan}</strong></td>
+        </tr>
+        <tr>
+        <td style="color:#a9b0c3;font-size:12px;">Estado</td>
+        <td align="right" style="color:#ffffff;font-size:12px;"><strong>ACTIVA</strong></td>
+        </tr>
+        <tr>
+        <td style="color:#a9b0c3;font-size:12px;">Próxima renovación</td>
+        <td align="right" style="color:#ffffff;font-size:12px;"><strong>{renovacion}</strong></td>
+        </tr>
+        <tr>
+        <td style="color:#a9b0c3;font-size:12px;">ID Suscripción</td>
+        <td align="right" style="color:#ffffff;font-size:12px;font-family:Consolas,monospace;">
+        {subscription_id}
+        </td>
+        </tr>
+        </table>
+
+        <!-- Cómo activar -->
+        <div style="margin-top:18px;color:#c7cce0;font-size:14px;line-height:1.6;">
+        <strong style="color:#fff;">Cómo activar tu licencia:</strong>
+        <ol style="margin:8px 0 0 18px;padding:0;">
+        <li>Abre la aplicación LUNA.</li>
+        <li>Pega tu clave.</li>
+        <li>Dale al botón de activar ahora.</li>
+        </ol>
+        </div>
+
+        <!-- Botón -->
+        <div style="margin-top:18px;">
+        <a href="{{APP_OPEN_URL}}" style="background:#6d5efc;color:#fff;
+        padding:12px 18px;border-radius:10px;font-size:14px;font-weight:bold;
+        text-decoration:none;display:inline-block;">
+        Abrir LUNA
+        </a>
+        </div>
+
+        <!-- Soporte -->
+        <p style="margin-top:16px;color:#a9b0c3;font-size:12px;line-height:1.6;">
+        Si tienes algún problema, responde a este correo indicando tu <strong>License Key</strong>
+        y tu <strong>ID de suscripción</strong>.
+        No compartas tu clave públicamente.
+        </p>
+
+        <hr style="border:none;border-top:1px solid #223053;margin:18px 0;">
+
+        <p style="color:#8f96ad;font-size:11px;">
+        © 2026 LUNA. Todos los derechos reservados.
+        </p>
+        </td>
+        </tr>
+
+        </table>
+        </td>
+        </tr>
+        </table>
+        </body>
+        </html>
+    """
+
+    msg = EmailMessage()
+    msg.set_content(f"Su código de verificación es:")  # Texto plano
+    msg.add_alternative(HTML_CONTENT, subtype="html")
+
+    msg["Subject"] = "Código de verificación | Reservas Express"
+    msg["From"] = "Reservas Express <contactjuegosilimitados@gmail.com>"
+    msg["To"] = destinatario
+
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
+            smtp.login("contactjuegosilimitados@gmail.com", "eghh betm mobn evnf")
+            smtp.send_message(msg)
+        print("Correo enviado con éxito a", destinatario)
+        return True
+    except Exception as e:
+        print("Error al enviar correo:", e)
+        return False
+    
+
+@app.get("/paypal/verify-subscription")
+async def verify_subscription(
+    user_id: str,
+    db: AsyncSession = Depends(get_db)
+):
+    # 1) Buscar última suscripción del usuario
+    q = await db.execute(
+        select(PaypalSubscription)
+        .where(PaypalSubscription.user_id == user_id)
+        .order_by(PaypalSubscription.created_at.desc())
+        .limit(1)
+    )
+    sub = q.scalar_one_or_none()
+
+    if not sub:
+        return { "ok": False, "status": "NO_SUBSCRIPTION" }
+
+    # 2) Consultar PayPal
+    token = await get_access_token()
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.get(
+            f"{PAYPAL_BASE_URL}/v1/billing/subscriptions/{sub.paypal_subscription_id}",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+    if r.status_code != 200:
+        return { "ok": False, "status": "PAYPAL_ERROR" }
+
+    data = r.json()
+    paypal_status = data["status"]  # ACTIVE, CANCELLED, SUSPENDED...
+
+    # 3) Buscar licencia usando subscription_id
+    q = await db.execute(
+        select(License)
+        .where(License.user_id == sub.paypal_subscription_id)
+        .limit(1)
+    )
+    license = q.scalar_one_or_none()
+
+    if not license:
+        return {
+            "ok": False,
+            "status": paypal_status,
+            "msg": "LICENSE_NOT_FOUND"
+        }
+
+    return {
+        "ok": paypal_status == "ACTIVE",
+        "subscription_id": sub.paypal_subscription_id,
+        "status": paypal_status,
+        "license_key": license.license_key,
+    }
 
     

@@ -3,22 +3,20 @@ from dotenv import load_dotenv
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
 
-from config import DATABASE_URL, IS_PROD, validate_settings
-
+# Carga las variables de entorno desde el archivo .env
 load_dotenv()
-validate_settings()
 
-url = DATABASE_URL
+url = os.getenv("DATABASE_URL")
 
-# Render/Heroku sometimes provide postgresql://; ensure asyncpg driver
+if url is None:
+    raise ValueError("DATABASE_URL no definida")
+
 if url.startswith("postgresql://") and "+asyncpg" not in url:
     url = url.replace("postgresql://", "postgresql+asyncpg://")
 
-engine = create_async_engine(
-    url,
-    echo=(not IS_PROD),          # no SQL echo in production
-    pool_pre_ping=True,
-)
+DATABASE_URL = url
+
+engine = create_async_engine(DATABASE_URL, echo=True)
 
 AsyncSessionLocal = sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
 
