@@ -58,7 +58,7 @@ from typing import Optional
 from urllib.parse import urlparse, parse_qs
 import httpx
 import re
-from models import Planes, PaypalEnv, License, PaypalWebhookEvent
+from models import Planes, PaypalEnv, License, PaypalWebhookEvent, LicenseStatus
 
 from db import get_db
 
@@ -193,8 +193,11 @@ async def ensure_license_ok(db: AsyncSession, licenseKey: str, deviceId: str) ->
     if not lic:
         raise HTTPException(status_code=401, detail="Licencia inválida")
 
-    if lic["status"] != "active":
-        raise HTTPException(status_code=403, detail="Licencia desactivada")
+    if lic["status"] == "revoked" and lic["status"] != "active":
+        raise HTTPException(status_code=405, detail="Licencia revocada")
+    if lic["status"] == "expired" and lic["status"] != "active":
+        raise HTTPException(status_code=404, detail="Licencia desactivada")
+
 
     # 1.1) Verificar expiración (UTC)
     exp_at = lic["expires_at"]
@@ -818,51 +821,205 @@ async def _mark_paypal_event(db: AsyncSession, *, event_row_id: int, status: str
     )
 
 
+
+class ActivateSchema(BaseModel):
+    license_key: str
+
+@app.post("/paypal/subscription-activate")
+async def paypal_subscription_activate(
+    payload: ActivateSchema,
+    db: AsyncSession = Depends(get_db),
+):
+    stmt = select(License).where(License.license_key == payload.license_key)
+    result = await db.execute(stmt)
+    license = result.scalar_one_or_none()
+
+    if not license:
+        raise HTTPException(status_code=404, detail="Licencia no encontrada")
+
+    if license.paypal_status == "ACTIVE" and not getattr(license, "cancel_requested", False):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "ok": False,
+                "msg": "La suscripción ya estaba activa"
+            }
+        )
+
+    subscription_id = license.user_id
+    token = await get_access_token()
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(
+            f"{PAYPAL_BASE_URL}/v1/billing/subscriptions/{subscription_id}/activate",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            },
+            json={"reason": "Reactivación de suscripción"}
+        )
+
+    if r.status_code >= 400:
+        raise HTTPException(status_code=400, detail=r.json())
+
+    await db.execute(text("SET LOCAL app.verified_write = '1'"))
+
+    license.cancel_requested = False
+    license.payment_error = False
+    license.last_sync_at = utcnow() if hasattr(license, "last_sync_at") else getattr(license, "last_sync_at", None)
+
+    stmt_sub = (
+        select(PaypalSubscription)
+        .where(PaypalSubscription.paypal_subscription_id == subscription_id)
+        .order_by(desc(PaypalSubscription.created_at))
+        .limit(1)
+    )
+    result_sub = await db.execute(stmt_sub)
+    subscription = result_sub.scalar_one_or_none()
+
+    if subscription:
+        subscription.status = "ACTIVE"
+
+    await db.commit()
+    await db.refresh(license)
+
+    return {"ok": True}
+
+class SuspendSchema(BaseModel):
+    license_key: str
+    
+@app.post("/paypal/subscription-suspend")
+async def paypal_subscription_suspend(
+    payload: SuspendSchema,
+    db: AsyncSession = Depends(get_db),
+):
+    stmt = select(License).where(License.license_key == payload.license_key)
+    result = await db.execute(stmt)
+    license = result.scalar_one_or_none()
+
+    if not license:
+        raise HTTPException(status_code=404, detail="Licencia no encontrada")
+
+    if license.paypal_status == "CANCELLED":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "ok": False,
+                "msg": "La suscripción fue cancelada definitivamente y no puede suspenderse"
+            }
+        )
+
+    if license.paypal_status == "SUSPENDED" and getattr(license, "cancel_requested", False):
+        return {"ok": True, "msg": "La suscripción ya estaba suspendida"}
+
+    subscription_id = license.user_id
+    token = await get_access_token()
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(
+            f"{PAYPAL_BASE_URL}/v1/billing/subscriptions/{subscription_id}/suspend",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            },
+            json={"reason": "Suspensión solicitada por el usuario"}
+        )
+
+    if r.status_code >= 400:
+        raise HTTPException(status_code=400, detail=r.json())
+
+    await db.execute(text("SET LOCAL app.verified_write = '1'"))
+
+    license.paypal_status = "SUSPENDED"
+    license.cancel_requested = True
+
+    stmt_sub = (
+        select(PaypalSubscription)
+        .where(PaypalSubscription.paypal_subscription_id == subscription_id)
+        .order_by(desc(PaypalSubscription.created_at))
+        .limit(1)
+    )
+    result_sub = await db.execute(stmt_sub)
+    subscription = result_sub.scalar_one_or_none()
+
+    if subscription:
+        subscription.status = "SUSPENDED"
+
+    await db.commit()
+    await db.refresh(license)
+
+    return {"ok": True}
+
+def _extract_subscription_id_any(event_type: str, body: dict) -> str | None:
+        resource = body.get("resource", {}) or {}
+
+        sid = _extract_subscription_id(event_type, body)
+        if sid:
+            return sid
+
+        for k in (
+            "billing_agreement_id",
+            "subscription_id",
+            "agreement_id",
+            "id",
+        ):
+            v = resource.get(k)
+            if isinstance(v, str) and v:
+                return v
+
+        supp = resource.get("supplementary_data") or {}
+        related = (supp.get("related_ids") or {}) if isinstance(supp, dict) else {}
+        for k in (
+            "subscription_id",
+            "billing_agreement_id",
+            "agreement_id",
+        ):
+            v = related.get(k)
+            if isinstance(v, str) and v:
+                return v
+
+        links = resource.get("links") or []
+        if isinstance(links, list):
+            for l in links:
+                href = (l or {}).get("href")
+                if isinstance(href, str) and "/subscriptions/" in href:
+                    return href.split("/subscriptions/")[-1].split("?")[0].strip() or None
+
+        return None
 @app.post("/paypal/webhook")
 async def paypal_webhook(request: Request, db: AsyncSession = Depends(get_db)):
     _rate_limit(request, limiter_webhook)
     body = await request.json()
+    env = PaypalEnv.sandbox
 
-    # ✅ ENV (ajústalo a tu config real)
-    # Si guardas env="sandbox" en PaypalSubscription, usa sandbox aquí.
-    env = PaypalEnv.sandbox  # en producción: PaypalEnv.live
-
-    # ✅ 0) REGISTRAR EVENTO (SIEMPRE PRIMERO) + idempotencia
     try:
         is_dup, event_row_id = await _register_paypal_event(db, env=env, body=body)
-        await db.commit()  # commit SOLO del log
+        await db.commit()
     except Exception as e:
         await db.rollback()
-        # Para no provocar reintentos infinitos de PayPal, responde 200
         return {"ok": True, "msg": f"No se pudo registrar el evento: {str(e)}"}
 
-    # Si es duplicado, no reproceses
     if is_dup:
         return {"ok": True, "duplicate": True}
 
     try:
-        # 1) Verificar firma (solo si está activado)
         if VERIFY_PAYPAL_WEBHOOKS:
             token = await get_access_token()
             await verify_paypal_webhook(request, body, token)
-        # else: DEV ONLY
 
-        # 2) Procesar evento
         event_type = body.get("event_type")
         resource = body.get("resource", {}) or {}
-
-        # ✅ subscription_id robusto
-        subscription_id = _extract_subscription_id(event_type, body)
-
-        # status
+        subscription_id = _extract_subscription_id_any(event_type, body)
         status = resource.get("status")
-
-        # user_id (custom_id) puede venir o no según evento
         user_id = resource.get("custom_id")
 
-        # 3) DB update
+        print("EVENT TYPE:", event_type)
+        print("SUBSCRIPTION ID:", subscription_id)
+        print("BODY:", body)
+
         if not subscription_id:
-            # No puedo asociar nada, pero el evento ya quedó logueado
             await _mark_paypal_event(db, event_row_id=event_row_id, status="processed")
             await db.commit()
             return {"ok": True, "msg": "No subscription_id found in webhook"}
@@ -876,7 +1033,6 @@ async def paypal_webhook(request: Request, db: AsyncSession = Depends(get_db)):
         row = q.scalar_one_or_none()
 
         if not row:
-            # crear
             row = PaypalSubscription(
                 env="sandbox",
                 user_id=user_id or "UNKNOWN",
@@ -887,51 +1043,46 @@ async def paypal_webhook(request: Request, db: AsyncSession = Depends(get_db)):
                 raw=body,
             )
             db.add(row)
-            await db.flush()  # asegura row.id si lo necesitas
+            await db.flush()
         else:
-            row.status = status or row.status
+            if user_id and row.user_id in (None, "", "UNKNOWN"):
+                row.user_id = user_id
+            if resource.get("plan_id") and not row.paypal_plan_id:
+                row.paypal_plan_id = resource.get("plan_id")
             row.raw = body
 
-        # ✅ ACTIVAR (cuando se activa la suscripción)
-        is_active = (event_type == "BILLING.SUBSCRIPTION.ACTIVATED" or status == "ACTIVE")
+        async def get_license():
+            qlic = await db.execute(
+                select(License)
+                .where(License.user_id == subscription_id)
+                .order_by(desc(License.created_at))
+                .limit(1)
+            )
+            return qlic.scalar_one_or_none()
 
-        if is_active and getattr(row, "license_id", None) is None:
-            key = None
-            lic = None
+        async def create_license_if_missing():
+            lic = await get_license()
 
-            for _ in range(5):
-                key = generate_license_key()
+            if lic:
+                return lic, False
 
-                # ⚠️ Si tu diseño REAL es que License.user_id sea el machine_id:
-                # usa: user_id=(row.user_id or user_id or "UNKNOWN")
-                # Si tu diseño es usar subscription_id como "user_id" de licencia, deja esto:
-                lic = License(
-                    user_id=subscription_id,
-                    license_key=key,
-                    status="active",
-                    max_devices=2,
-                    notes=f"Created from PayPal webhook {subscription_id}",
-                )
-                db.add(lic)
+            key = generate_license_key()
+            lic = License(
+                user_id=subscription_id,
+                license_key=key,
+                status="active",
+                max_devices=2,
+                notes=f"Activated by PayPal webhook {subscription_id}",
+                paypal_status="ACTIVE",
+                cancel_requested=False,
+            )
+            db.add(lic)
+            await db.flush()
 
-                try:
-                    await db.flush()
-                    row.license_id = lic.id
-                    break
-                except Exception:
-                    await db.rollback()
+            if getattr(row, "license_id", None) is None:
+                row.license_id = lic.id
 
-                    # Re-obtener la suscripción para evitar estado inválido
-                    q2 = await db.execute(
-                        select(PaypalSubscription)
-                        .where(PaypalSubscription.paypal_subscription_id == subscription_id)
-                        .order_by(desc(PaypalSubscription.created_at))
-                        .limit(1)
-                    )
-                    row = q2.scalar_one()
-
-            # Enviar correo si hay email guardado y key creada
-            if row and getattr(row, "subscriber_email", None) and key:
+            if getattr(row, "subscriber_email", None):
                 enviar_correo(
                     row.subscriber_email,
                     key,
@@ -940,98 +1091,104 @@ async def paypal_webhook(request: Request, db: AsyncSession = Depends(get_db)):
                     renovacion="21/2/2026",
                     subscription_id=subscription_id,
                 )
-            else:
-                print("Esta suscripción no tiene correo guardado aún")
 
-        # ✅ Pagos mensuales: sale/capture completed
-        is_payment_ok = event_type in ("PAYMENT.SALE.COMPLETED", "PAYMENT.CAPTURE.COMPLETED")
+            return lic, True
 
-        if is_payment_ok:
-            qlic = await db.execute(
-                select(License)
-                .where(License.user_id == subscription_id)
-                .limit(1)
-            )
-            lic = qlic.scalar_one_or_none()
+        lic = await get_license()
+
+        if event_type == "BILLING.SUBSCRIPTION.ACTIVATED":
+            row.status = "ACTIVE"
 
             if not lic:
-                for _ in range(5):
-                    key = generate_license_key()
-                    lic = License(
-                        user_id=subscription_id,
-                        license_key=key,
-                        status="active",
-                        max_devices=2,
-                        notes=f"Activated by payment webhook {subscription_id}",
-                    )
-                    db.add(lic)
-                    try:
-                        await db.flush()
-                        break
-                    except Exception:
-                        await db.rollback()
-            else:
-                if lic.status != "active":
-                    lic.status = "active"
-                    lic.paypal_status = "ACTIVE"
-                    lic.cancel_requested = False
+                lic, _ = await create_license_if_missing()
 
-        # ✅ REVOCAR
-        lic = None
+            lic.paypal_status = "ACTIVE"
+            lic.cancel_requested = False
 
-        if event_type in (
-            "BILLING.SUBSCRIPTION.CANCELLED",
-            "BILLING.SUBSCRIPTION.SUSPENDED",
-            "BILLING.SUBSCRIPTION.EXPIRED",
-        ):
-            # buscar licencia (si existe)
-            qlic = await db.execute(
-                select(License)
-                .where(License.user_id == subscription_id)
-                .order_by(desc(License.created_at))
-                .limit(1)
-            )
-            lic = qlic.scalar_one_or_none()
+            if hasattr(lic, "payment_error"):
+                lic.payment_error = False
 
-            # ✅ SIEMPRE marcar intención de cancelación
+
+        elif event_type == "BILLING.SUBSCRIPTION.SUSPENDED":
+            row.status = "SUSPENDED"
             if lic:
+                lic.paypal_status = "SUSPENDED"
+                lic.status = "revoked"
+
+        elif event_type == "BILLING.SUBSCRIPTION.CANCELLED":
+            row.status = "CANCELLED"
+            if lic:
+                lic.paypal_status = "CANCELLED"
                 lic.cancel_requested = True
+                lic.status = "revoked"
 
-            # ✅ Si es CANCELLED: NO tocar status local ni revocar (PayPal puede seguir ACTIVE hasta fin de periodo)
-            if event_type == "BILLING.SUBSCRIPTION.CANCELLED":
-                pass
+        elif event_type == "BILLING.SUBSCRIPTION.EXPIRED":
+            row.status = "EXPIRED"
+            if lic:
+                lic.paypal_status = "EXPIRED"
+                lic.status = "revoked"
 
-            else:
-                # SUSPENDED / EXPIRED sí deben reflejarse localmente
-                map_status = {
-                    "BILLING.SUBSCRIPTION.SUSPENDED": "SUSPENDED",
-                    "BILLING.SUBSCRIPTION.EXPIRED": "EXPIRED",
-                }
-                row.status = map_status.get(event_type, row.status)
+        elif event_type == "BILLING.SUBSCRIPTION.PAYMENT.FAILED":
+            if lic and hasattr(lic, "payment_error"):
+                lic.payment_error = True
 
-                if lic:
-                    lic.status = "revoked"
-                    lic.paypal_status = row.status
-        # ✅ Marcar evento como processed + commit final
+        elif event_type in (
+            "BILLING.SUBSCRIPTION.PAYMENT.COMPLETED",
+            "PAYMENT.SALE.COMPLETED",
+            "PAYMENT.CAPTURE.COMPLETED",
+        ):
+            row.status = "ACTIVE"
+
+            if not lic:
+                lic, _ = await create_license_if_missing()
+
+            lic.paypal_status = "ACTIVE"
+            lic.cancel_requested = False
+            lic.status = "active"
+
+            if hasattr(lic, "payment_error"):
+                lic.payment_error = False
+
+            billing_info = body.get("resource", {}).get("billing_info") or {}
+            last_payment = billing_info.get("last_payment") or {}
+
+            lp_time = parse_iso(last_payment.get("time"))
+            if lp_time and hasattr(lic, "last_payment_time"):
+                lic.last_payment_time = lp_time
+
+            if hasattr(lic, "last_payment_amount"):
+                lic.last_payment_amount = (last_payment.get("amount") or {}).get("value")
+
+            if hasattr(lic, "last_payment_currency"):
+                lic.last_payment_currency = (last_payment.get("amount") or {}).get("currency_code")
+
+            if hasattr(lic, "next_billing_time"):
+                lic.next_billing_time = parse_iso(billing_info.get("next_billing_time"))
+
+            if hasattr(lic, "paid_through"):
+                lic.paid_through = compute_paid_through_monthly(lp_time)
+
+        else:
+            if status:
+                row.status = status
+
         await _mark_paypal_event(db, event_row_id=event_row_id, status="processed")
         await db.commit()
-        return {"ok": True}
+        return {"ok": True, "event_type": event_type, "subscription_id": subscription_id}
 
     except Exception as e:
         await db.rollback()
-
-        # ✅ Marcar evento como failed (commit separado)
         try:
             await _mark_paypal_event(db, event_row_id=event_row_id, status="failed")
             await db.commit()
         except Exception:
             await db.rollback()
 
-        # Responder 200 para que PayPal no reintente infinito.
-        return {"ok": True, "msg": "Evento registrado pero falló el procesamiento", "error": str(e)}
-
-
-
+        return {
+            "ok": True,
+            "msg": "Evento registrado pero falló el procesamiento",
+            "error": str(e),
+        }
 # 
 class CreateProductBody(BaseModel):
     name: str = "LUNA Premium"
@@ -1244,24 +1401,20 @@ def compute_premium_window(
     last_payment_time: datetime | None,
     next_billing_time: datetime | None,
 ) -> tuple[bool, datetime | None]:
-    """
-    premium = now < paid_through
-    paid_through = next_billing_time OR last_payment_time + 1 mes
-    """
     now = utcnow()
     status = safe_upper(paypal_status)
 
-    paid_through = next_billing_time if is_dt(next_billing_time) else None
-    if not paid_through:
-        paid_through = compute_paid_through_monthly(last_payment_time)
+    paid_through = compute_paid_through_monthly(last_payment_time)
 
     if not paid_through:
         return False, None
 
-    if status == "EXPIRED":
+    if status in {"EXPIRED", "CANCELLED", "SUSPENDED"}:
         return False, paid_through
 
     return now < paid_through, paid_through
+
+
 
 CANCEL_REFRESH_WINDOW_HOURS = 24
 CANCEL_TTL_MINUTES = 15
@@ -1337,21 +1490,16 @@ def build_response(
 
 
 def compute_premium_from_local(lic) -> bool:
-    """
-    Decide si la licencia es premium SOLO con datos locales.
-    No llama a PayPal.
-    """
-    # Si tienes status local
-    status = getattr(lic, "status", None)
-    if status == "active":
-        return True
-
-    # Fallback por fecha (si existe paid_through)
     paid_through = getattr(lic, "paid_through", None)
     if isinstance(paid_through, datetime):
         return utcnow() < paid_through
 
-    # Último fallback: no premium
+    lpt = getattr(lic, "last_payment_time", None)
+    if isinstance(lpt, datetime):
+        computed = compute_paid_through_monthly(lpt)
+        if computed:
+            return utcnow() < computed
+
     return False
 
 
@@ -1396,12 +1544,11 @@ async def verify_license(
     force_refresh: bool = Query(False),
     db: AsyncSession = Depends(get_db),
 ):
-    # 1) Buscar licencia
     q = await db.execute(select(License).where(License.license_key == license_key))
     lic = q.scalar_one_or_none()
     if not lic:
         raise HTTPException(status_code=404, detail="Licencia no encontrada")
-    
+
     if bool(get_attr(lic, "suspicious", False)):
         return build_response(
             lic=lic,
@@ -1413,7 +1560,6 @@ async def verify_license(
             warning="LICENSE_MARKED_SUSPICIOUS",
         )
 
-    # 2) subscription_id (nuevo campo primero, fallback al user_id antiguo)
     subscription_id = (
         (get_attr(lic, "paypal_subscription_id", None) or get_attr(lic, "user_id", None) or "")
         .strip()
@@ -1436,19 +1582,14 @@ async def verify_license(
             "paypal": None,
         }
 
-    # 3) Decide si refrescar:
-    #    - force_refresh=True => siempre PayPal
-    #    - cancel_requested=True => PayPal cada 15 min
-    #    - normal => PayPal por TTL VERIFY_TTL_HOURS
     last_sync_at = get_attr(lic, "last_sync_at", None)
     cancel_requested = bool(get_attr(lic, "cancel_requested", False))
 
-    cancel_stale = is_stale(last_sync_at, CANCEL_TTL_MINUTES / 60)  # minutos -> horas
+    cancel_stale = is_stale(last_sync_at, CANCEL_TTL_MINUTES / 60)
     normal_stale = is_stale(last_sync_at, VERIFY_TTL_HOURS)
 
     must_refresh = bool(force_refresh) or (cancel_requested and cancel_stale) or normal_stale
 
-    # 4) CACHE si está fresco y no hay que refrescar
     if not must_refresh:
         premium_local = compute_premium_from_local(lic)
         return build_response(
@@ -1456,11 +1597,10 @@ async def verify_license(
             subscription_id=subscription_id,
             premium=premium_local,
             source="CACHE",
-            paypal_status_real=None,  # cache: no consultamos PayPal
+            paypal_status_real=None,
             paid_through=get_attr(lic, "paid_through", None),
         )
 
-    # 5) PAYPAL REFRESH
     try:
         data = await refresh_from_paypal(subscription_id)
         paypal_status_real = safe_upper(data.get("status"))
@@ -1476,43 +1616,33 @@ async def verify_license(
             last_payment_time=last_payment_time,
             next_billing_time=next_billing_time,
         )
-        
+
         if paid_through and paid_through > utcnow() + timedelta(days=45):
-            mark_suspicious(
-                lic,
-                f"PAID_THROUGH_TOO_FAR paid_through={paid_through.isoformat()}"
-            )
+            mark_suspicious(lic, f"PAID_THROUGH_TOO_FAR paid_through={paid_through.isoformat()}")
             premium_final = False
 
-        # Guardar mínimos
         set_attr_if_exists(lic, "user_id", subscription_id)
         set_attr_if_exists(lic, "last_sync_at", utcnow())
 
-        # Guardar billing SOLO si existen columnas
         set_attr_if_exists(lic, "last_payment_time", last_payment_time)
         set_attr_if_exists(lic, "last_payment_amount", (last_payment.get("amount") or {}).get("value"))
         set_attr_if_exists(lic, "last_payment_currency", (last_payment.get("amount") or {}).get("currency_code"))
         set_attr_if_exists(lic, "next_billing_time", next_billing_time)
         set_attr_if_exists(lic, "paid_through", paid_through)
 
-        # ✅ CANCELLED pero aún pagado -> mantener premium, marcar cancel_requested, NO tocar paypal_status
-        if paypal_status_real == "CANCELLED" and premium_final:
-            set_attr_if_exists(lic, "cancel_requested", True)
-            if hasattr(lic, "cancel_requested_at") and get_attr(lic, "cancel_requested_at", None) is None:
-                set_attr_if_exists(lic, "cancel_requested_at", utcnow())
-            # NO tocar paypal_status
-        else:
-            set_attr_if_exists(lic, "paypal_status", paypal_status_real)
-            set_attr_if_exists(lic, "cancel_requested", paypal_status_real == "CANCELLED")
-            if hasattr(lic, "cancel_requested_at"):
-                set_attr_if_exists(
-                    lic,
-                    "cancel_requested_at",
-                    utcnow() if paypal_status_real == "CANCELLED" else None
-                )
+        set_attr_if_exists(lic, "paypal_status", paypal_status_real)
 
-        # estado local
+        prev_cancel_requested = bool(get_attr(lic, "cancel_requested", False))
+        new_cancel_requested = prev_cancel_requested or (paypal_status_real == "CANCELLED")
+        set_attr_if_exists(lic, "cancel_requested", new_cancel_requested)
+
+        if hasattr(lic, "cancel_requested_at"):
+            prev_at = get_attr(lic, "cancel_requested_at", None)
+            if new_cancel_requested and prev_at is None:
+                set_attr_if_exists(lic, "cancel_requested_at", utcnow())
+
         set_attr_if_exists(lic, "status", "active" if premium_final else "revoked")
+
         await db.execute(text("SET LOCAL app.verified_write = '1'"))
         await db.commit()
         await db.refresh(lic)
@@ -1546,7 +1676,7 @@ async def verify_license(
                 "error": str(e),
             },
         )
-
+        
 def enviar_correo(destinatario: str, key: str, max_devices: str, plan: str, renovacion: str, subscription_id: str):
     # Si quieres usar un link real, define esto arriba o pásalo como parámetro
     APP_OPEN_URL = "https://tu-dominio.com/abrir-luna"  # o luna://open si usas deep link
@@ -1795,7 +1925,6 @@ async def verify_user(
         billing_info = data.get("billing_info") or {}
         last_payment = billing_info.get("last_payment") or {}
 
-        # Guardar en BD
         lic.user_id = subscription_id
         lic.paypal_status = paypal_status
         lic.last_payment_time = parse_iso(last_payment.get("time"))
@@ -1804,8 +1933,16 @@ async def verify_user(
         lic.next_billing_time = parse_iso(billing_info.get("next_billing_time"))
         lic.last_sync_at = utcnow()
 
-        # Sincronizar estado local básico
-        lic.status = "active" if paypal_status == "ACTIVE" else "revoked"
+        premium_final, paid_through = compute_premium_window(
+            paypal_status=paypal_status,
+            last_payment_time=lic.last_payment_time,
+            next_billing_time=lic.next_billing_time,
+        )
+
+        if hasattr(lic, "paid_through"):
+            lic.paid_through = paid_through
+
+        lic.status = "active" if premium_final else "revoked"
 
         await db.commit()
         await db.refresh(lic)
@@ -1863,5 +2000,210 @@ async def verify_user(
             },
         )
   
+from decimal import Decimal
+from datetime import datetime, timezone
+from fastapi import Depends, HTTPException
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+import httpx
 
-    
+
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+@app.post("/paypal/subscription-capture")
+async def paypal_subscription_capture(
+    payload: dict,
+    db: AsyncSession = Depends(get_db)
+):
+    license_key = payload.get("license_key")
+    if not license_key:
+        raise HTTPException(status_code=400, detail="license_key required")
+
+    result = await db.execute(
+        select(License).where(License.license_key == license_key)
+    )
+    lic = result.scalar_one_or_none()
+
+    if not lic:
+        raise HTTPException(status_code=404, detail="License not found")
+
+    # OJO: aquí uso user_id como subscription_id porque en tu código anterior
+    # estabas guardando subscription_id en lic.user_id
+    subscription_id = getattr(lic, "subscription_id", None) or getattr(lic, "user_id", None)
+
+    if not subscription_id:
+        raise HTTPException(status_code=400, detail="License has no subscription_id")
+
+    token = await get_access_token()
+
+    # 1) Leer suscripción actual
+    async with httpx.AsyncClient(timeout=30) as client:
+        sub_res = await client.get(
+            f"{PAYPAL_BASE_URL}/v1/billing/subscriptions/{subscription_id}",
+            headers={"Authorization": f"Bearer {token}"}
+        )
+
+    if sub_res.status_code >= 400:
+        try:
+            detail = sub_res.json()
+        except Exception:
+            detail = {"error": sub_res.text}
+        raise HTTPException(status_code=400, detail=detail)
+
+    sub = sub_res.json()
+    billing_info = sub.get("billing_info") or {}
+    outstanding_balance = billing_info.get("outstanding_balance") or {}
+    last_payment = billing_info.get("last_payment") or {}
+
+    outstanding_value_raw = outstanding_balance.get("value")
+    outstanding_currency = outstanding_balance.get("currency_code") or "USD"
+
+    try:
+        outstanding_value = Decimal(str(outstanding_value_raw or "0"))
+    except Exception:
+        outstanding_value = Decimal("0")
+
+    # 2) Si no hay saldo pendiente, no hay nada que capturar
+    if outstanding_value <= 0:
+        # Igual sincronizamos datos locales
+        lic.paypal_status = sub.get("status")
+        lic.last_payment_time = parse_iso(last_payment.get("time"))
+        lic.last_payment_amount = (
+            Decimal(str((last_payment.get("amount") or {}).get("value")))
+            if (last_payment.get("amount") or {}).get("value") is not None
+            else None
+        )
+        lic.last_payment_currency = (last_payment.get("amount") or {}).get("currency_code")
+        lic.next_billing_time = parse_iso(billing_info.get("next_billing_time"))
+        lic.last_sync_at = utcnow()
+        lic.paid_through = compute_paid_through_monthly(lic.last_payment_time)
+
+        now = utcnow()
+        paid_through = lic.paid_through
+        lic.status = (
+            LicenseStatus.active
+            if paid_through is not None and now < paid_through
+            else LicenseStatus.revoked
+        )
+
+        await db.commit()
+        await db.refresh(lic)
+
+        return {
+            "ok": False,
+            "message": "No outstanding balance to capture",
+            "license": {
+                "license_key": lic.license_key,
+                "status_local": lic.status.value if hasattr(lic.status, "value") else str(lic.status),
+                "subscription_id": subscription_id,
+                "paid_through": lic.paid_through.isoformat() if lic.paid_through else None,
+                "last_sync_at": lic.last_sync_at.isoformat() if lic.last_sync_at else None,
+                "cancel_requested": lic.cancel_requested,
+            },
+            "paypal": {
+                "status": lic.paypal_status,
+                "outstanding_balance": str(outstanding_value),
+                "last_payment_time": lic.last_payment_time.isoformat() if lic.last_payment_time else None,
+                "last_payment_amount": str(lic.last_payment_amount) if lic.last_payment_amount is not None else None,
+                "last_payment_currency": lic.last_payment_currency,
+                "next_billing_time": lic.next_billing_time.isoformat() if lic.next_billing_time else None,
+            }
+        }
+
+    # 3) Capturar saldo pendiente
+    capture_payload = {
+        "note": "Manual capture of outstanding subscription balance",
+        "capture_type": "OUTSTANDING_BALANCE",
+        "amount": {
+            "currency_code": outstanding_currency,
+            "value": f"{outstanding_value:.2f}"
+        }
+    }
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        cap_res = await client.post(
+            f"{PAYPAL_BASE_URL}/v1/billing/subscriptions/{subscription_id}/capture",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            json=capture_payload,
+        )
+
+    if cap_res.status_code >= 400:
+        try:
+            detail = cap_res.json()
+        except Exception:
+            detail = {"error": cap_res.text}
+        raise HTTPException(status_code=400, detail=detail)
+
+    try:
+        capture_data = cap_res.json()
+    except Exception:
+        capture_data = {"raw": cap_res.text}
+
+    # 4) Refrescar suscripción después del capture
+    async with httpx.AsyncClient(timeout=30) as client:
+        refresh_res = await client.get(
+            f"{PAYPAL_BASE_URL}/v1/billing/subscriptions/{subscription_id}",
+            headers={"Authorization": f"Bearer {token}"}
+        )
+
+    if refresh_res.status_code >= 400:
+        try:
+            detail = refresh_res.json()
+        except Exception:
+            detail = {"error": refresh_res.text}
+        raise HTTPException(status_code=400, detail=detail)
+
+    fresh = refresh_res.json()
+    fresh_billing = fresh.get("billing_info") or {}
+    fresh_last_payment = fresh_billing.get("last_payment") or {}
+
+    lic.paypal_status = fresh.get("status")
+    lic.last_payment_time = parse_iso(fresh_last_payment.get("time"))
+    lic.last_payment_amount = (
+        Decimal(str((fresh_last_payment.get("amount") or {}).get("value")))
+        if (fresh_last_payment.get("amount") or {}).get("value") is not None
+        else None
+    )
+    lic.last_payment_currency = (fresh_last_payment.get("amount") or {}).get("currency_code")
+    lic.next_billing_time = parse_iso(fresh_billing.get("next_billing_time"))
+    lic.last_sync_at = utcnow()
+    lic.cancel_requested = False
+
+    # paid_through SOLO desde pago real
+    lic.paid_through = compute_paid_through_monthly(lic.last_payment_time)
+
+    now = utcnow()
+    paid_through = lic.paid_through
+    lic.status = (
+        LicenseStatus.active
+        if paid_through is not None and now < paid_through
+        else LicenseStatus.revoked
+    )
+
+    await db.commit()
+    await db.refresh(lic)
+
+    return {
+        "ok": True,
+        "capture_response": capture_data,
+        "license": {
+            "license_key": lic.license_key,
+            "status_local": lic.status.value if hasattr(lic.status, "value") else str(lic.status),
+            "subscription_id": subscription_id,
+            "paid_through": lic.paid_through.isoformat() if lic.paid_through else None,
+            "last_sync_at": lic.last_sync_at.isoformat() if lic.last_sync_at else None,
+            "cancel_requested": lic.cancel_requested,
+        },
+        "paypal": {
+            "status": lic.paypal_status,
+            "last_payment_time": lic.last_payment_time.isoformat() if lic.last_payment_time else None,
+            "last_payment_amount": str(lic.last_payment_amount) if lic.last_payment_amount is not None else None,
+            "last_payment_currency": lic.last_payment_currency,
+            "next_billing_time": lic.next_billing_time.isoformat() if lic.next_billing_time else None,
+        }
+    }

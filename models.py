@@ -107,6 +107,8 @@ class License(Base):
         default=False,                 # ORM
         server_default=text("false")   # DB
     )
+    
+    payment_error: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
     # ✅ NUEVO: hasta cuándo tiene acceso premium
     paid_through: Mapped[datetime | None] = mapped_column(
