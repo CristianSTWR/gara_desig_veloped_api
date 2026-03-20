@@ -1083,12 +1083,12 @@ async def paypal_webhook(request: Request, db: AsyncSession = Depends(get_db)):
                 row.license_id = lic.id
 
             if getattr(row, "subscriber_email", None):
-                enviar_correo(
-                    row.subscriber_email,
-                    key,
-                    max_devices="2",
-                    plan="LUNA PREMIUM",
-                    renovacion="21/2/2026",
+                 enviar_correo(
+                     row.subscriber_email,
+                     key,
+                     max_devices="2",
+                     plan="LUNA PREMIUM",
+                     renovacion="21/2/2026",
                     subscription_id=subscription_id,
                 )
 
@@ -1678,6 +1678,7 @@ async def verify_license(
         )
         
 def enviar_correo(destinatario: str, key: str, max_devices: str, plan: str, renovacion: str, subscription_id: str):
+    return
     # Si quieres usar un link real, define esto arriba o pásalo como parámetro
     APP_OPEN_URL = "https://tu-dominio.com/abrir-luna"  # o luna://open si usas deep link
 
